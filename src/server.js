@@ -1,31 +1,52 @@
 // server.js
 import express from "express";
 import multer from "multer";
-import multerS3 from 'multer-s3';
+import multerS3 from "multer-s3";
 import cors from "cors";
-import { s3Client, S3_BUCKET } from './config/aws.js';
+import { GetObjectCommand } from "@aws-sdk/client-s3";
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import { s3Client, S3_BUCKET } from "./config/aws.js";
 import AudioTranscriptionService from "./services/transcriptionService.js";
 import dotenv from "dotenv";
 
 dotenv.config();
 
 const app = express();
+
+// Configure multer-s3
 const upload = multer({
   storage: multerS3({
     s3: s3Client,
     bucket: S3_BUCKET,
-    key: function (req, file, cb) {
-      cb(null, `uploads/${Date.now()}-${file.originalname}`);
+    metadata: function (req, file, cb) {
+      cb(null, { fieldName: file.fieldname });
     },
+    key: function (req, file, cb) {
+      const timestamp = Date.now().toString();
+      const fileName = file.originalname.replace(/\s+/g, '-').toLowerCase();
+      cb(null, `uploads/${timestamp}-${fileName}`);
+    }
   }),
+  limits: {
+    fileSize: 50 * 1024 * 1024 // 50MB limit
+  }
 });
 
-const transcriptionService = new AudioTranscriptionService(
-  process.env.ASSEMBLY_AI_KEY
-);
+// Function to generate presigned URL
+async function generatePresignedUrl(bucket, key) {
+  const command = new GetObjectCommand({
+    Bucket: bucket,
+    Key: key
+  });
+  
+  // URL expires in 1 hour
+  return await getSignedUrl(s3Client, command, { expiresIn: 3600 });
+}
 
 app.use(cors());
 app.use(express.json());
+
+const transcriptionService = new AudioTranscriptionService(process.env.ASSEMBLY_AI_KEY);
 
 // Status endpoint
 app.get("/health", (req, res) => {
@@ -45,19 +66,21 @@ app.post("/transcribe", upload.single("audio"), async (req, res) => {
       });
     }
 
-    // Upload to AssemblyAI
-    const audioUrl = req.file.location;
+    // Generate a presigned URL for the uploaded file
+    const presignedUrl = await generatePresignedUrl(
+      req.file.bucket,
+      req.file.key
+    );
 
-    if (!audioUrl) {
-      return res.status(500).json({
-        success: false,
-        error: "Failed to upload audio file",
-      });
-    }
+    console.log("File uploaded successfully:", {
+      presignedUrl,
+      key: req.file.key,
+      bucket: req.file.bucket,
+    });
 
     // Start transcription
     const transcriptionResult = await transcriptionService.transcribeAudio(
-      audioUrl,
+      presignedUrl,
       {
         languageCode: language,
         speakerLabels: true,
